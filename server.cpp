@@ -188,69 +188,142 @@ public:
 class thread_pool
 {
 private:
-    thread_safe_queue<function<void()>> work_q;
-    vector<thread> threads;
-    atomic<bool> done = false;
-    unsigned thread_num = thread::hardware_concurrency() > 2 ? thread::hardware_concurrency() : 2;
 
-    void worker_thread()
-    {
-        while (!done)
-        {
-            function<void()> task;
-            if (work_q.try_pop(task))
-            {
-                task();
-            }
-            else
-            {
-                this_thread::yield();
-            }
-        }
-    }
+	vector<unique_ptr<local_deque>>local_deque_v;
+	thread_safe_queue<function_pack> work_q;
+	vector<thread>threads;
+	atomic <bool> done = false;
+	static thread_local unsigned thread_i;
+	static thread_local local_deque* local_q;
+	unsigned thread_num = thread::hardware_concurrency() > 2 ? thread::hardware_concurrency() : 2;
+
+	bool from_local(function_pack&task)
+	{
+		if (local_q)
+		{
+			return local_q->try_pop(task);
+	
+		}
+		return false;
+	}
+	bool from_pool(function_pack& task)
+	{
+		if (!work_q.is_empty())
+		{
+
+			return work_q.try_pop(task);
+		
+		}
+		return false;
+	}
+	
+	bool steal_other(function_pack&task)
+	{
+		for (unsigned i = 0; i < thread_num; i++)
+		{
+			unsigned other_i = (thread_i + i + 1) % local_deque_v.size();
+			if (local_deque_v[other_i]->try_steal(task))
+			{
+				return true;
+			}
+			
+		}
+		return false;
+	}
+	void run_task()
+	{
+		function_pack task;
+		if (from_local(task) || from_pool(task) || steal_other(task))
+		{
+			task();
+		}
+		else
+		{
+			this_thread::yield();
+		}
+	}
+	void do_work(unsigned temp_i)
+	{
+		thread_i = temp_i;
+		local_q = local_deque_v[thread_i].get();
+
+
+		while (!done)
+		{
+			run_task();
+		}
+	}
 
 public:
-    thread_pool()
-    {
-        try
-        {
-            for (unsigned i = 0; i < thread_num; ++i)
-            {
-                threads.emplace_back(&thread_pool::worker_thread, this);
-            }
-        }
-        catch (...)
-        {
-            stop();
-            throw;
-        }
-    }
 
-    template<typename func>
-    future<invoke_result_t<func>> submit(func f)
-    {
-        using type = invoke_result_t<func>;
-        auto task = make_shared<packaged_task<type()>>(move(f));
-        future<type> res = task->get_future();
-        work_q.push([task]() { (*task)(); });
-        return res;
-    }
+	template<typename func>
+	future<invoke_result_t<func>>submit(func f)
+	{
 
-    void stop()
-    {
-        done = true;
-        work_q.notify_all();
-        for (auto& t : threads)
-        {
-            if (t.joinable()) t.join();
-        }
-    }
+		using type = invoke_result_t<func>;
+		packaged_task<type()>task(move(f));
+		future<type>res = task.get_future();
+		if (local_q)
+		{
+			local_q->push_front(function_pack(move(task)));
 
-    ~thread_pool()
-    {
-        stop();
-    }
+		}
+		else
+		{
+			work_q.push(function_pack(move(task)));
+		}
+	
+		return res;
+
+	}
+
+	void stop()
+	{
+		if (done == true)
+		{
+			return;
+		}
+		done = true;
+		for (auto& t : threads)
+		{
+			if (t.joinable())
+			{
+				t.join();
+			}
+		}
+		work_q.clear();
+	}
+	
+	thread_pool()
+	{
+
+		try
+		{
+			for (unsigned i = 0; i < thread_num; i++)
+			{
+				local_deque_v.push_back(make_unique<local_deque>());
+
+			}
+			for (unsigned i = 0; i < thread_num; i++)
+			{
+				threads.emplace_back(&thread_pool::do_work, this, i);
+
+			}
+		}
+		catch (...)
+		{
+			stop();
+			throw;
+		}
+	}
+	~thread_pool()
+	{
+
+		stop();
+	}
 };
+thread_local unsigned thread_pool::thread_i = 0;
+thread_local local_deque* thread_pool::local_q = nullptr;
 void client_work(int c_fd,int c_port,string c_ip)
 {
     std::cout<<"客户端:"<<c_ip<<"端口:"<<c_port<<"已接入"<<endl;
