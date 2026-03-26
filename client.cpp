@@ -29,6 +29,7 @@ int main()
     if(ret==-1)
     {
         cerr<<"connect is wrong";
+        close(fd);
         return -1;
 
     }
@@ -52,6 +53,7 @@ int main()
        if(ret_s<0)
        {
         cerr<<"send is wrong";
+        close(fd);
         return -1;
        }
        char buff_c[1024];
@@ -59,6 +61,7 @@ int main()
        if(len<1)
        {
         cerr<<"服务器断开"<<endl;
+        close(fd);
         return -1;
        }
        string server_s(buff_c,len);
