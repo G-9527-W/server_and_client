@@ -13,7 +13,13 @@
 #include <future>
 #include <functional>
 #include <type_traits>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <errno.h>
 using namespace std;
+const int BUFF_SIZE=1024;
+const int EVENT_MAX=1024;
+const int LISTEN_MAX=128;
 template<typename T>
 class thread_safe_queue
 {
@@ -324,33 +330,49 @@ public:
 };
 thread_local unsigned thread_pool::thread_i = 0;
 thread_local local_deque* thread_pool::local_q = nullptr;
-void client_work(int c_fd,int c_port,string c_ip)
+void set_nolock(int fd)
 {
-    std::cout<<"客户端:"<<c_ip<<"端口:"<<c_port<<"已接入"<<endl;
-    char buff[1024];
-   
+	int flag=fcntl(fd,F_GETFL,0);
+	fcntl(fd,F_SETFL,flag|O_NONBLOCK);
+
+}
+void epoll_del(int epfd,int fd)
+{
+	epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);
+
+}
+void client_work(int c_fd,int epfd)
+{
+    std::cout<<"客户端:"<<c_fd<<"已接入"<<endl;
+    char buff[BUFF_SIZE];
+    memset(buff,0,sizeof(buff));
     while(true)
     {
-        memset(buff,0,sizeof(buff));
+        
         int len=recv(c_fd,buff,sizeof(buff),0);
         if(len==0)
         {
-            cout<<"客户端:"<<c_ip<<"已断开"<<endl;
+            cout<<"客户端:"<<c_fd<<"已断开"<<endl;
+			epoll_del(epfd,c_fd);
             close(c_fd);
             break;
         }
         if(len<0)
         {
-            cerr<<"客户端:"<<c_ip<<" 接入失败"<<endl;
+			if(errno==EAGAIN)return ;
+
+            cerr<<"客户端:"<<c_fd<<" 接入失败"<<endl;
+			epoll_del(epfd,c_fd);
             close(c_fd);
             return ;
         }
         string client_s(buff,len);
-        cout<<"客户端:"<<c_ip<<"传入"<<client_s<<endl;
+        cout<<"客户端:"<<c_fd<<"传入"<<client_s<<endl;
         int ret_s=send(c_fd,buff,len,0);
         if(ret_s<0)
         {
-            cerr<<"客户端:"<<c_ip<<" 传回失败"<<endl;
+            cerr<<"客户端:"<<c_fd<<" 传回失败"<<endl;
+			epoll_del(epfd,c_fd);
             close(c_fd);
             return ;
         }
@@ -360,51 +382,85 @@ void client_work(int c_fd,int c_port,string c_ip)
 int main()
 {
     thread_pool pool;
-    int fd=socket(AF_INET,SOCK_STREAM,0);
-    if(fd<0)
+    int l_fd=socket(AF_INET,SOCK_STREAM,0);
+    if(l_fd<0)
     {
         cerr<<"socket is wrong";
-        close(fd);
+        close(l_fd);
         return -1;
     }
-    struct sockaddr_in saddr;
+    sockaddr_in saddr;
     saddr.sin_family=AF_INET;
     saddr.sin_port=htons(8898);
     saddr.sin_addr.s_addr=htonl(INADDR_ANY);
-    int ret=bind(fd,(struct sockaddr*)&saddr,sizeof(saddr));
+    int ret=bind(l_fd,(struct sockaddr*)&saddr,sizeof(saddr));
     if(ret<0)
     {
         cerr<<"bind is wrong";
-        close(fd);
+        close(l_fd);
         return -1;
     }
-    ret=listen(fd,128);
+    ret=listen(l_fd,LISTEN_MAX);
     if(ret<0)
     {
         cerr<<"listen is wrong";
         return -1;
     }
-  
+	int epfd=epoll_create1(0);
+	if(epfd<0) 
+	{
+		cerr<<"epoll_create1 is wrong"<<endl;
+		return -1;
+	}
+	set_nolock(l_fd);
+
+    epoll_event ev;
+	ev.data.fd=l_fd;
+	ev.events=EPOLLIN|EPOLLET;
+	epoll_ctl(epfd,EPOLL_CTL_ADD,l_fd,&ev);
+	vector<epoll_event>events(EVENT_MAX);
+
 
     while(true)
     {
-        struct sockaddr_in caddr;
-        socklen_t size_len=sizeof(caddr);
-        int cfd=accept(fd,(struct sockaddr*)&caddr,&size_len);
-        if(cfd<0)
-       {
-           cerr<<"accept is wrong";
-           return -1;
+		int num=epoll_wait(epfd,events.data(),EVENT_MAX,-1);
+		for(int i=0;i<num;i++)
+		{
+			int fd=events[i].data.fd;
+			if(fd==l_fd)
+			{
+				while(true)
+				{
+					struct sockaddr_in caddr;
+                    socklen_t size_len=sizeof(caddr);
+                    int cfd=accept(fd,(struct sockaddr*)&caddr,&size_len);
+					if(cfd<0)
+					{
+					    if(errno==EAGAIN)
+				       {
+						break;
+					   }
+					    break;
 
-        }
-        char ip[32];
-        inet_ntop(AF_INET,&caddr.sin_addr.s_addr,ip,sizeof(ip));
-        string client_ip(ip);
-        int cport=ntohs(caddr.sin_port);
-        pool.submit([=]{client_work(cfd,cport,client_ip);});
+					}
+					set_nolock(cfd);
+					ev.data.fd=cfd;
+					ev.events=EPOLLIN|EPOLLET;
+					epoll_ctl(epfd,EPOLL_CTL_ADD,cfd,&ev);
+				}
+			}
+			else if (events[i].events&EPOLLIN)
+			{
+                pool.submit([=]{client_work(fd,epfd);});
+			}
+			
+		}
+       
         
      
 
     }
-    close(fd);
+    close(l_fd);
+	close(epfd);
+	return 0;
 }
